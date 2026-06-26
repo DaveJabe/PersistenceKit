@@ -4,8 +4,12 @@ import PackageDescription
 let package = Package(
     name: "PersistenceKit",
     platforms: [
-        .iOS("18.6"),
-        .macOS("14.0")   // host floor so `swift build`/`swift test` run on the Mac
+        // Floors track GRDB's own minimums (iOS 13 / macOS 10.15 / tvOS 13 / watchOS 7); kept a little
+        // higher for the modern concurrency / Combine surface this package uses.
+        .iOS(.v16),
+        .macOS(.v13),
+        .watchOS(.v9),
+        .tvOS(.v16)
     ],
     products: [
         .library(name: "PersistenceKit", targets: ["PersistenceKit"])
