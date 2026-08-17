@@ -54,6 +54,19 @@ struct DatabaseActorTests {
         mutating func didInsert(_ inserted: InsertionSuccess) { id = inserted.rowID }
     }
 
+    /// Caller-keyed record referencing `parent` — a non-mutating `PersistableRecord` (unlike `Child`),
+    /// so it is usable with `saveAll` while still able to violate a foreign-key constraint. Its table
+    /// comes from an extra migration registered by the tests that need it, not the shared schema.
+    private struct Link: Codable, FetchableRecord, PersistableRecord, TableRecord {
+        var id: Int64
+        var parentId: Int64
+        static let databaseTableName = "link"
+        enum CodingKeys: String, CodingKey {
+            case id
+            case parentId = "parent_id"
+        }
+    }
+
     // MARK: - Fixtures
 
     private func makeMigrator() -> DatabaseMigrator {
@@ -120,6 +133,43 @@ struct DatabaseActorTests {
 
         #expect(throws: MigrationFailure.self) {
             _ = try DatabaseActor.inMemory(migrator: migrator)
+        }
+    }
+
+    @Test("a failed second migration keeps the committed first; a fixed migrator resumes on reopen")
+    func failedSecondMigrationResumesOnReopen() async throws {
+        struct MigrationFailure: Error {}
+        try await withTemporaryDirectory { directory in
+            let url = directory.appendingPathComponent("migrating.sqlite")
+            let v1 = { @Sendable (database: Database) throws in
+                try database.create(table: "widget") { table in
+                    table.primaryKey("id", .integer)
+                    table.column("name", .text).notNull()
+                }
+                try database.execute(sql: "INSERT INTO widget (id, name) VALUES (1, 'seeded')")
+            }
+
+            var broken = DatabaseMigrator()
+            broken.registerMigration("v1", migrate: v1)
+            broken.registerMigration("v2") { _ in throw MigrationFailure() }
+            #expect(throws: MigrationFailure.self) {
+                _ = try DatabaseActor(path: url, migrator: broken)
+            }
+
+            // Each migration runs in its own transaction, so v1 is committed on disk. Reopening
+            // with a fixed migrator must skip v1 (no "table exists" error, no duplicate seed row)
+            // and apply v2 where the failed run left off.
+            var fixed = DatabaseMigrator()
+            fixed.registerMigration("v1", migrate: v1)
+            fixed.registerMigration("v2") { database in
+                try database.create(table: "extra") { table in
+                    table.autoIncrementedPrimaryKey("id")
+                }
+            }
+            let reopened = try DatabaseActor(path: url, migrator: fixed)
+            #expect(try await reopened.fetchAll(Widget.self) == [Widget(id: 1, name: "seeded")])
+            #expect(try await reopened.read { database in try database.tableExists("extra") })
+            try await reopened.close()
         }
     }
 
@@ -198,6 +248,90 @@ struct DatabaseActorTests {
         }
     }
 
+    @Test("makeBackupCopy replaces whatever is at the destination, backup after backup")
+    func backupCopyOverwritesPreviousBackup() async throws {
+        try await withTemporaryDirectory { directory in
+            let sourceURL = directory.appendingPathComponent("source.sqlite")
+            let backupURL = directory.appendingPathComponent("backup.sqlite")
+            let actor = try DatabaseActor(path: sourceURL, migrator: makeMigrator())
+
+            // A stale non-database file at the destination must not break the first backup
+            // (the destination-cleanup path), and a second backup to the same URL must reflect
+            // writes made since the first — the periodic-backup loop production relies on.
+            try Data("not a database".utf8).write(to: backupURL)
+            try await actor.save(Widget(id: 1, name: "first"))
+            try await actor.makeBackupCopy(to: backupURL)
+
+            try await actor.save(Widget(id: 2, name: "second"))
+            try await actor.makeBackupCopy(to: backupURL)
+
+            let fileManager = FileManager.default
+            #expect(!fileManager.fileExists(atPath: backupURL.path + "-wal"))
+            #expect(!fileManager.fileExists(atPath: backupURL.path + "-shm"))
+
+            let copy = try DatabaseQueue(path: backupURL.path)
+            let names = try await copy.read { database in
+                try String.fetchAll(database, sql: "SELECT name FROM widget ORDER BY id")
+            }
+            #expect(names == ["first", "second"])
+            try copy.close()
+            try await actor.close()
+        }
+    }
+
+    @Test("makeBackupCopy after close() throws DatabaseActorError.closed")
+    func backupCopyAfterCloseThrows() async throws {
+        try await withTemporaryDirectory { directory in
+            let actor = try DatabaseActor(
+                path: directory.appendingPathComponent("db.sqlite"), migrator: makeMigrator()
+            )
+            try await actor.close()
+
+            let backupURL = directory.appendingPathComponent("backup.sqlite")
+            await #expect(throws: DatabaseActorError.self) {
+                try await actor.makeBackupCopy(to: backupURL)
+            }
+            #expect(!FileManager.default.fileExists(atPath: backupURL.path))
+        }
+    }
+
+    @Test("makeBackupCopy taken during a stream of writes is a coherent snapshot", .timeLimit(.minutes(1)))
+    func backupCopyIsCoherentUnderInterleavedWrites() async throws {
+        try await withTemporaryDirectory { directory in
+            let sourceURL = directory.appendingPathComponent("live.sqlite")
+            let actor = try DatabaseActor(path: sourceURL, migrator: makeMigrator())
+            let seedCount = 10
+            let totalCount = 200
+            try await actor.saveAll((0..<seedCount).map { Widget(id: Int64($0), name: "w\($0)") })
+
+            // Stream sequential commits through the actor while the backup runs.
+            let writer = Task {
+                for i in seedCount..<totalCount {
+                    try await actor.save(Widget(id: Int64(i), name: "w\(i)"))
+                }
+            }
+            try await Task.sleep(for: .milliseconds(5)) // let some of the stream land first
+            let backupURL = directory.appendingPathComponent("snapshot.sqlite")
+            try await actor.makeBackupCopy(to: backupURL)
+            try await writer.value
+
+            // The copy must be structurally sound and a consistent point-in-time snapshot:
+            // the saves commit in id order, so a coherent snapshot is a contiguous prefix.
+            let copy = try DatabaseQueue(path: backupURL.path)
+            let integrity = try await copy.read { database in
+                try String.fetchOne(database, sql: "PRAGMA integrity_check")
+            }
+            #expect(integrity == "ok")
+            let ids = try await copy.read { database in
+                try Int64.fetchAll(database, sql: "SELECT id FROM widget ORDER BY id")
+            }
+            #expect(ids.count >= seedCount)
+            #expect(ids == Array(0..<Int64(ids.count)))
+            try copy.close()
+            try await actor.close()
+        }
+    }
+
     // MARK: - Foreign keys
 
     @Test("foreign-key enforcement: a dangling reference insert throws")
@@ -252,6 +386,28 @@ struct DatabaseActorTests {
 
         try await actor.saveAll([Widget(id: 1, name: "a"), Widget(id: 2, name: "b")])
         #expect(try await actor.fetchCount(Widget.self) == 2)
+        try await actor.close()
+    }
+
+    @Test("saveAll is atomic: a mid-batch failure rolls back the earlier records")
+    func saveAllRollsBackWholeBatchOnFailure() async throws {
+        var migrator = makeMigrator()
+        migrator.registerMigration("link") { database in
+            try database.create(table: "link") { table in
+                table.primaryKey("id", .integer)
+                table.column("parent_id", .integer).notNull()
+                    .references("parent", onDelete: .cascade)
+            }
+        }
+        let actor = try DatabaseActor.inMemory(migrator: migrator)
+        try await actor.save(Parent(id: 1))
+
+        // The first record is valid; the second violates the foreign key. The documented
+        // single-transaction contract requires the valid first record to be rolled back too.
+        await #expect(throws: (any Error).self) {
+            try await actor.saveAll([Link(id: 1, parentId: 1), Link(id: 2, parentId: 999)])
+        }
+        #expect(try await actor.fetchCount(Link.self) == 0)
         try await actor.close()
     }
 
@@ -322,6 +478,57 @@ struct DatabaseActorTests {
             Keyed.self, id: "missing", column: Column("value"), to: "x", idColumn: "code"
         )
         #expect(unchanged == 0)
+        try await actor.close()
+    }
+
+    // MARK: - Cancellation & concurrency
+
+    @Test("a write cancelled mid-transaction throws CancellationError and rolls back", .timeLimit(.minutes(1)))
+    func cancelledWriteThrowsCancellationErrorAndRollsBack() async throws {
+        let actor = try DatabaseActor.inMemory(migrator: makeMigrator())
+        let writeStarted = EmissionRecorder<Bool>()
+        let cancelDelivered = DispatchSemaphore(value: 0)
+
+        let writeTask = Task {
+            try await actor.write { database in
+                var first = Item(id: nil, name: "rolled-back")
+                try first.insert(database)
+                writeStarted.record(true)
+                // Blocks GRDB's writer dispatch queue (not a cooperative thread) until the test
+                // has cancelled the wrapping task; the next statement then sees the cancellation.
+                cancelDelivered.wait()
+                var second = Item(id: nil, name: "never-lands")
+                try second.insert(database)
+            }
+        }
+
+        _ = await writeStarted.next()
+        writeTask.cancel() // Task.cancel() runs GRDB's cancellation handler before returning.
+        cancelDelivered.signal()
+
+        // GRDB 7 contract: the cancelled access throws CancellationError (not a DatabaseError)…
+        let result = await writeTask.result
+        #expect(throws: CancellationError.self) { try result.get() }
+
+        // …and the whole transaction is rolled back: the first insert never became visible.
+        #expect(try await actor.fetchCount(Item.self) == 0)
+        try await actor.close()
+    }
+
+    @Test("concurrent saves through the actor all persist", .timeLimit(.minutes(1)))
+    func concurrentSavesAllPersist() async throws {
+        let actor = try DatabaseActor.inMemory(migrator: makeMigrator())
+
+        try await withThrowingTaskGroup(of: Void.self) { group in
+            for i in 1...100 {
+                group.addTask {
+                    try await actor.save(Widget(id: Int64(i), name: "widget-\(i)"))
+                }
+            }
+            try await group.waitForAll()
+        }
+
+        #expect(try await actor.fetchCount(Widget.self) == 100)
         try await actor.close()
     }
 
@@ -416,6 +623,100 @@ struct DatabaseActorTests {
         #expect(await recorder.next()?.name == "changed")
         try await actor.close()
     }
+
+    @Test("observeAll (plain overload) observes a non-Equatable record", .timeLimit(.minutes(1)))
+    func observeAllPlainOverloadObservesNonEquatableRecord() async throws {
+        let actor = try DatabaseActor.inMemory(migrator: makeMigrator())
+        let recorder = EmissionRecorder<[Keyed]>()
+        // `Keyed` is not Equatable, so overload resolution must select the plain (non-deduplicating)
+        // overload — this stops compiling if that overload is ever removed.
+        let cancellable = actor.observeAll(Keyed.self).sink(
+            receiveCompletion: { _ in },
+            receiveValue: { recorder.record($0) }
+        )
+        defer { cancellable.cancel() }
+
+        #expect(await recorder.next().isEmpty)
+
+        try await actor.save(Keyed(code: "k", value: "v"))
+        let afterWrite = await recorder.next()
+        #expect(afterWrite.map(\.code) == ["k"])
+        try await actor.close()
+    }
+
+    @Test("observeAll (Equatable overload) collapses consecutive identical emissions", .timeLimit(.minutes(1)))
+    func observeAllEquatableCollapsesDuplicateEmissions() async throws {
+        let actor = try DatabaseActor.inMemory(migrator: makeMigrator())
+        let recorder = EmissionRecorder<[Widget]>()
+        let cancellable = actor.observeAll(Widget.self).sink(
+            receiveCompletion: { _ in },
+            receiveValue: { recorder.record($0) }
+        )
+        defer { cancellable.cancel() }
+
+        #expect(await recorder.next().isEmpty)
+
+        try await actor.save(Widget(id: 1, name: "same"))
+        #expect(await recorder.next() == [Widget(id: 1, name: "same")])
+
+        // A same-value upsert touches the tracked region, so the observation re-fetches an identical
+        // array — removeDuplicates must swallow it. The pause lets that cycle finish, so it cannot be
+        // coalesced with the real change below into a single fetch.
+        try await actor.save(Widget(id: 1, name: "same"))
+        try await Task.sleep(for: .milliseconds(200))
+
+        try await actor.save(Widget(id: 1, name: "changed"))
+        #expect(await recorder.next() == [Widget(id: 1, name: "changed")])
+        try await actor.close()
+    }
+
+    @Test("close() under an active subscription: the publisher goes quiet, no error, no hang", .timeLimit(.minutes(1)))
+    func closeUnderActiveSubscriptionGoesQuiet() async throws {
+        let actor = try DatabaseActor.inMemory(migrator: makeMigrator())
+        let events = EmissionRecorder<String>()
+        let cancellable = actor.observeAll(Item.self).sink(
+            receiveCompletion: { completion in
+                switch completion {
+                case .failure: events.record("failure")
+                case .finished: events.record("finished")
+                }
+            },
+            receiveValue: { events.record("value(\($0.count))") }
+        )
+        defer { cancellable.cancel() }
+
+        #expect(await events.next() == "value(0)")
+        try await actor.close()
+
+        // Current contract (pinned deliberately): close() succeeds under an active observation, and
+        // with no further writes possible the publisher simply stays silent — it does not error out.
+        try await Task.sleep(for: .milliseconds(200))
+        #expect(events.poll() == nil)
+    }
+
+    @Test("subscribing after close() fails with a GRDB error, not a hang", .timeLimit(.minutes(1)))
+    func subscribingAfterCloseFailsWithGRDBError() async throws {
+        let actor = try DatabaseActor.inMemory(migrator: makeMigrator())
+        try await actor.close()
+
+        // The nonisolated observation surface bypasses the actor's isClosed guard, so the initial
+        // fetch reaches GRDB and surfaces its "closed database" DatabaseError as a .failure —
+        // pinned here so the contract (GRDB error, not DatabaseActorError.closed) cannot drift.
+        let events = EmissionRecorder<String>()
+        let cancellable = actor.observeAll(Item.self).sink(
+            receiveCompletion: { completion in
+                if case .failure(let error) = completion {
+                    events.record(error is DatabaseError ? "failure(DatabaseError)" : "failure(\(type(of: error)))")
+                } else {
+                    events.record("finished")
+                }
+            },
+            receiveValue: { _ in events.record("value") }
+        )
+        defer { cancellable.cancel() }
+
+        #expect(await events.next() == "failure(DatabaseError)")
+    }
 }
 
 // MARK: - Test support
@@ -461,5 +762,13 @@ private final class EmissionRecorder<Value: Sendable>: @unchecked Sendable {
                 continuation.resume(returning: buffered)
             }
         }
+    }
+
+    /// Pops the next buffered value without suspending, or returns `nil` when nothing has arrived —
+    /// for asserting that a publisher stayed silent.
+    func poll() -> Value? {
+        lock.lock()
+        defer { lock.unlock() }
+        return buffer.isEmpty ? nil : buffer.removeFirst()
     }
 }
