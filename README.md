@@ -9,6 +9,10 @@ read/write/fetch/save/delete primitives, a `ValueObservation` → Combine bridge
 online-backup copy. **Your schema, records, and migrations stay in your app** — PersistenceKit owns only
 the connection lifecycle and the plumbing.
 
+Since 1.2 it also lets an iOS app put its databases to sleep before the system suspends it
+(`DatabaseSuspension`), opens files the app ships without migrating them (`ReadOnlyDatabase`), and
+takes your own GRDB `Configuration` when the default is not what you need.
+
 ## Why it exists
 
 Every GRDB app re-writes the same actor: a `DatabaseQueue` behind an `actor`, the WAL / foreign-keys
@@ -29,7 +33,7 @@ Because the public API surfaces GRDB types directly (`Column`, `ValueObservation
 ## Installation
 
 ```swift
-.package(url: "https://github.com/DaveJabe/PersistenceKit.git", from: "1.1.0")
+.package(url: "https://github.com/DaveJabe/PersistenceKit.git", from: "1.2.0")
 ```
 
 ## Usage
@@ -141,6 +145,82 @@ being written to:
 ```swift
 try await database.makeBackupCopy(to: backupURL)
 ```
+
+### 6. Your own configuration
+
+`init(path:migrator:configuration:)` and `inMemory(migrator:configuration:)` open the connection with
+your GRDB `Configuration` instead of the default. It is used exactly as given, so start from
+`DatabaseActor.defaultConfiguration` (WAL, foreign keys on) and change only what you mean to:
+
+```swift
+var configuration = DatabaseActor.defaultConfiguration
+configuration.label = "app"
+let database = try DatabaseActor(path: url, migrator: migrator, configuration: configuration)
+
+database.configuration.label   // "app": what the connection was opened with
+```
+
+The 1.1 initialisers are unchanged and still open with `defaultConfiguration`.
+
+### 7. Letting go when iOS suspends the app
+
+iOS kills an app that is suspended while it holds a SQLite lock (`0xdead10cc`): a read or write in
+flight when the user switches away is enough. GRDB can put a database to sleep first, and
+`DatabaseSuspension` is the opt-in. It is off by default, so nothing changes for an app that does not
+use it.
+
+1. Open the database observing suspension:
+
+   ```swift
+   var configuration = DatabaseActor.defaultConfiguration
+   configuration.observesSuspensionNotifications = true
+   let database = try DatabaseActor(path: url, migrator: migrator, configuration: configuration)
+   ```
+
+2. Put it to sleep when the app may be suspended, and wake it before it is used again:
+
+   ```swift
+   DatabaseSuspension.suspend()   // on the way to the background with nothing running,
+                                  // and in a background task's expiration handler
+   DatabaseSuspension.resume()    // when the app comes back, and when background work starts
+   ```
+
+   When to call them is the app's decision, because only the app knows what work it still has running.
+
+3. Treat a refusal as "not now". A sleeping database rolls back a transaction in flight and refuses
+   anything that could take a lock (reads of a WAL database keep working). The work did not happen,
+   and the same work succeeds after `resume()`:
+
+   ```swift
+   do {
+       try await database.save(record)
+   } catch let error where DatabaseSuspension.isInterruption(error) {
+       // Stop; the next launch or the next trigger finishes this.
+   }
+   ```
+
+The notifications reach every database in the process that observes them, so tests that post them
+belong in a serialized suite.
+
+### 8. Files you ship
+
+A database inside the app bundle (a dictionary, a catalogue) cannot be written, and `DatabaseActor`
+always runs a migrator, which writes. `ReadOnlyDatabase.open(at:immutable:)` opens such a file read-only
+without migrating it, and returns GRDB's `DatabaseQueue`, which reads synchronously or with `await`:
+
+```swift
+let url = Bundle.main.url(forResource: "dictionary", withExtension: "sqlite")!
+let dictionary = try ReadOnlyDatabase.open(at: url, immutable: true)
+let entry = try dictionary.read { db in try String.fetchOne(db, sql: "SELECT gloss FROM entry WHERE word = ?", arguments: ["cat"]) }
+```
+
+`immutable` has no default, because the wrong answer fails quietly. Pass `true` only for a file nothing
+can write, such as one inside the app bundle: SQLite then takes no lock on it at all, so a lookup in
+flight when the app is suspended holds nothing iOS could object to. Pass `false` for any file another
+connection or process may still write (a store shared with a widget or a watch app): told such a file
+never changes, SQLite would read stale rows or report corruption. Pass a `configuration` to label the
+connection or to observe suspension; `readonly` is always on. A missing file throws, and is never
+created.
 
 ## Design notes
 

@@ -3,10 +3,10 @@
 //  PersistenceKit
 //
 // A small, app-agnostic actor wrapping a GRDB `DatabaseQueue`: WAL + foreign-keys configured via GRDB's
-// `Configuration`, a caller-supplied `DatabaseMigrator` run at open, generic read/write/fetch/save/delete
-// primitives, a `ValueObservation` → Combine bridge, and SQLite's online-backup copy. The schema
-// (migrations, record types) is the consuming app's; this owns only the connection lifecycle and the
-// plumbing.
+// `Configuration` (or the caller's own), a caller-supplied `DatabaseMigrator` run at open, generic
+// read/write/fetch/save/delete primitives, a `ValueObservation` → Combine bridge, and SQLite's
+// online-backup copy. The schema (migrations, record types) is the consuming app's; this owns only the
+// connection lifecycle and the plumbing.
 
 import Combine
 import Foundation
@@ -26,7 +26,9 @@ public actor DatabaseActor {
     /// post-close reads/writes throw ``DatabaseActorError/closed`` deterministically.
     private var isClosed = false
 
-    /// The GRDB `Configuration` used for every connection this actor opens.
+    /// The GRDB `Configuration` that ``init(path:migrator:)`` and ``inMemory(migrator:)`` open every
+    /// connection with, and the starting point for a caller's own
+    /// (``init(path:migrator:configuration:)``).
     ///
     /// Setting `journalMode = .wal` lets GRDB do the right thing instead of hand-rolled pragmas:
     /// - Foreign-key enforcement is ON (GRDB's default), so `ON DELETE CASCADE` / `NOT NULL` references
@@ -34,24 +36,50 @@ public actor DatabaseActor {
     /// - The database is opened in WAL mode with GRDB's activation `CHECK`, `synchronous = NORMAL`, and a
     ///   pre-seeded `-wal` file so `ValueObservation` observes correctly from the first transaction.
     /// - For in-memory databases (which cannot use WAL) GRDB skips the WAL setup automatically.
-    private static var configuration: Configuration {
+    ///
+    /// It does not observe suspension; an app opts in (see ``DatabaseSuspension``).
+    public static var defaultConfiguration: Configuration {
         var configuration = Configuration()
         configuration.journalMode = .wal
         return configuration
     }
 
+    /// The configuration this actor's connection was opened with: ``defaultConfiguration``, or the
+    /// caller's own.
+    ///
+    /// `nonisolated` for the same reason as ``path``; useful for asserting in tests that a database was
+    /// opened the way the app means to open it (observing suspension, say).
+    public nonisolated var configuration: Configuration { databaseQueue.configuration }
+
     /// Opens (or creates) a file-backed database at `path` and runs `migrator` against it.
     ///
-    /// The connection is opened in WAL mode with foreign-key enforcement on (see ``configuration``).
+    /// The connection is opened in WAL mode with foreign-key enforcement on (see
+    /// ``defaultConfiguration``).
     public init(path: URL, migrator: DatabaseMigrator) throws {
-        self.databaseQueue = try DatabaseQueue(path: path.path, configuration: Self.configuration)
+        try self.init(path: path, migrator: migrator, configuration: Self.defaultConfiguration)
+    }
+
+    /// Opens (or creates) a file-backed database at `path` with the caller's GRDB `configuration`, and
+    /// runs `migrator` against it.
+    ///
+    /// The configuration is used exactly as given, so start from ``defaultConfiguration`` to keep WAL
+    /// and change only what you mean to change:
+    ///
+    /// ```swift
+    /// var configuration = DatabaseActor.defaultConfiguration
+    /// configuration.observesSuspensionNotifications = true
+    /// let database = try DatabaseActor(path: url, migrator: migrator, configuration: configuration)
+    /// ```
+    public init(path: URL, migrator: DatabaseMigrator, configuration: Configuration) throws {
+        self.databaseQueue = try DatabaseQueue(path: path.path, configuration: configuration)
         try migrator.migrate(databaseQueue)
     }
 
     /// Designated in-memory initializer. Creates an independent SQLite in-memory database (no file I/O)
-    /// and runs `migrator` against it. WAL is requested but GRDB skips it for in-memory databases.
-    private init(memory migrator: DatabaseMigrator) throws {
-        self.databaseQueue = try DatabaseQueue(named: nil, configuration: Self.configuration)
+    /// and runs `migrator` against it. The default configuration asks for WAL, and GRDB skips it for
+    /// in-memory databases.
+    private init(memory migrator: DatabaseMigrator, configuration: Configuration) throws {
+        self.databaseQueue = try DatabaseQueue(named: nil, configuration: configuration)
         try migrator.migrate(databaseQueue)
     }
 
@@ -60,7 +88,16 @@ public actor DatabaseActor {
     ///
     /// This is the blessed, non-crashable in-memory entry point.
     public static func inMemory(migrator: DatabaseMigrator) throws -> DatabaseActor {
-        try DatabaseActor(memory: migrator)
+        try DatabaseActor(memory: migrator, configuration: defaultConfiguration)
+    }
+
+    /// Creates a true SQLite in-memory database (no file I/O) with the caller's GRDB `configuration`,
+    /// and runs `migrator` against it. The configuration is used exactly as given (see
+    /// ``init(path:migrator:configuration:)``).
+    public static func inMemory(
+        migrator: DatabaseMigrator, configuration: Configuration
+    ) throws -> DatabaseActor {
+        try DatabaseActor(memory: migrator, configuration: configuration)
     }
 
     /// Creates a true SQLite in-memory database (no file I/O) and runs `migrator` against it.
@@ -69,7 +106,7 @@ public actor DatabaseActor {
     @available(*, deprecated, message: "Use DatabaseActor.inMemory(migrator:)")
     public init(inMemory: Bool, migrator: DatabaseMigrator) throws {
         precondition(inMemory, "Pass inMemory: true to use the in-memory initializer.")
-        try self.init(memory: migrator)
+        try self.init(memory: migrator, configuration: Self.defaultConfiguration)
     }
 
     // MARK: Database Methods
